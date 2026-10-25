@@ -76,6 +76,22 @@ declare_args() {
   # Sets -DVERIFY_PREDICTABLE
   v8_enable_verify_predictable = false
 
+  # WriteSentry scanner watch (Phase 1): arms a hardware write-watchpoint on
+  # the toplevel scanner's cursor field (Utf16CharacterStream::buffer_cursor_)
+  # during parsing. Windows-only; default off so pristine builds are unchanged.
+  v8_enable_writesentry_scanner_watch = false
+
+  # Independent two-entry, one-selected-thread observer. Legacy and selected
+  # modes are mutually exclusive so their sink/lifecycle contracts never mix.
+  v8_enable_writesentry_selected_worker_watch = false
+  v8_enable_writesentry_selected_worker_arm = false
+
+  # WriteSentry-independent parser entry, timing and lifetime markers.
+  v8_enable_writesentry_parser_timing = false
+
+  # Test-only fault injection for selected-worker control binaries.
+  v8_enable_writesentry_fault_tests = false
+
   # Enable DWARF line info for Torque files.
   # TODO(olivf): Find out how this works on other platforms.
   v8_enable_torque_dwarf = is_debug && is_linux
@@ -6242,6 +6258,22 @@ group("v8_tracing") {
   }
 }
 
+config("writesentry_parser_observation") {
+  defines = []
+  if (v8_enable_writesentry_selected_worker_watch) {
+    defines += [ "V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH" ]
+    if (v8_enable_writesentry_selected_worker_arm) {
+      defines += [ "V8_ENABLE_WRITESENTRY_SELECTED_WORKER_ARM" ]
+    }
+    if (v8_enable_writesentry_fault_tests) {
+      defines += [ "WRITESENTRY_FAULT_TESTS" ]
+    }
+  }
+  if (v8_enable_writesentry_parser_timing) {
+    defines += [ "V8_ENABLE_WRITESENTRY_PARSER_TIMING" ]
+  }
+}
+
 v8_cluster_source_set("v8_base_without_compiler") {
   # Only targets in this file and gcmole can depend on this.
   visibility = [
@@ -6626,6 +6658,8 @@ v8_cluster_source_set("v8_base_without_compiler") {
     "src/parsing/literal-buffer.cc",
     "src/parsing/parse-info.cc",
     "src/parsing/parser.cc",
+    "src/parsing/writesentry_parser_observer.cc",
+    "src/parsing/writesentry_parser_observer.h",
     "src/parsing/parsing.cc",
     "src/parsing/pending-compilation-error-handler.cc",
     "src/parsing/preparse-data.cc",
@@ -7354,6 +7388,46 @@ v8_cluster_source_set("v8_base_without_compiler") {
     sources += [ "src/extensions/vtunedomain-support-extension.cc" ]
     deps += [ "third_party/vtune:v8_vtune_trace_mark" ]
   }
+
+  # WriteSentry scanner watch (Phase 1): compile the flag-gated parser
+  # instrumentation and link the self-watch library. Windows-only; this file
+  # is also evaluated for the host toolchain (clang_x64) where the flag has
+  # no effect, so the assert is restricted to the primary toolchain.
+  defines = []
+  if (v8_enable_writesentry_scanner_watch &&
+      current_toolchain == default_toolchain) {
+    assert(is_win, "v8_enable_writesentry_scanner_watch is Windows-only")
+  }
+  if (v8_enable_writesentry_scanner_watch && is_win) {
+    defines = [ "V8_ENABLE_WRITESENTRY_SCANNER_WATCH" ]
+    deps += [ "//third_party/writesentry:writesentry" ]
+  }
+
+  if (current_toolchain == default_toolchain) {
+    assert(!(v8_enable_writesentry_scanner_watch &&
+             v8_enable_writesentry_selected_worker_watch),
+           "Legacy and selected-worker WriteSentry modes are mutually exclusive")
+    assert(!v8_enable_writesentry_selected_worker_arm ||
+           v8_enable_writesentry_selected_worker_watch,
+           "selected_worker_arm requires selected_worker_watch")
+    assert(!v8_enable_writesentry_fault_tests ||
+           v8_enable_writesentry_selected_worker_watch,
+           "WriteSentry fault tests require selected-worker mode")
+    if (v8_enable_writesentry_selected_worker_watch ||
+        v8_enable_writesentry_parser_timing) {
+      assert(is_win, "WriteSentry parser observation is Windows-only")
+    }
+  }
+  if (v8_enable_writesentry_selected_worker_watch && is_win) {
+    deps += [ "//third_party/writesentry:writesentry" ]
+    if (v8_enable_writesentry_fault_tests) {
+      deps += [ "//third_party/writesentry:writesentry_fault_test_core" ]
+    }
+  }
+  if ((v8_enable_writesentry_selected_worker_watch ||
+       v8_enable_writesentry_parser_timing) && is_win) {
+    public_configs = [ ":writesentry_parser_observation" ]
+  }
 }
 
 group("v8_base") {
@@ -7953,6 +8027,10 @@ v8_source_set("fuzzer_support") {
   # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
   # enable the diagnostic by removing this line.
   configs += [ "//build/config/compiler:no_exit_time_destructors" ]
+
+  if (v8_enable_writesentry_fault_tests && is_win) {
+    ldflags += [ "/OPT:NOICF" ]
+  }
 }
 
 v8_source_set("v8_bigint") {
@@ -8962,6 +9040,10 @@ v8_executable("d8") {
 
   if (v8_enable_vtunejit) {
     deps += [ "third_party/vtune:v8_vtune" ]
+  }
+  if ((v8_enable_writesentry_selected_worker_watch ||
+       v8_enable_writesentry_parser_timing) && is_win) {
+    configs += [ ":writesentry_parser_observation" ]
   }
   if (current_os == "zos" && is_component_build) {
     deps += [ ":zoslib" ]

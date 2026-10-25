@@ -82,6 +82,11 @@
 #include "src/parsing/parse-info.h"
 #include "src/parsing/parsing.h"
 #include "src/parsing/scanner-character-streams.h"
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+#include "src/parsing/writesentry_parser_observer.h"
+#endif
+#line 85
 #include "src/profiler/profile-generator.h"
 #include "src/sandbox/trap-fuzzer.h"
 #include "src/snapshot/snapshot.h"
@@ -1161,6 +1166,11 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
                           Local<String> name,
                           ReportExceptions report_exceptions,
                           Global<Value>* out_result) {
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  i::ParserObservationWorkerScope observation_workers;
+#endif
+#line 1164
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
   if (i_isolate->is_execution_terminating()) return true;
 
@@ -1237,6 +1247,11 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
       return false;
     }
   }
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  i::ParserObservationHostScope observation_host;
+#endif
+#line 1240
   Local<Script> script;
   if (!CompileSource<Script>(isolate, context, source, origin)
            .ToLocal(&script)) {
@@ -1263,6 +1278,11 @@ bool Shell::ExecuteSource(Isolate* isolate, const Source& source,
   }
 
   MaybeLocal<Value> maybe_result = script->Run(realm);
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  observation_host.Complete();
+#endif
+#line 1266
 
   if (options.code_cache_options ==
           ShellOptions::CodeCacheOptions::kProduceCacheAfterExecute &&

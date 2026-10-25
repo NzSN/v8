@@ -20,6 +20,12 @@
 #include "src/parsing/pending-compilation-error-handler.h"
 #include "src/parsing/preparse-data.h"
 
+#if defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+#include "src/parsing/writesentry_parser_observer.h"
+#endif
+
+#line 23
+
 namespace v8 {
 
 class Extension;
@@ -385,6 +391,10 @@ class V8_EXPORT_PRIVATE ParseInfo {
   void* compile_hint_callback_data_ = nullptr;
 
   //----------- Inputs+Outputs of parsing and scope analysis -----------------
+#if defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  // Declared before the stream so its destructor runs after stream teardown.
+  ParserObservationLifetimeMarker observation_lifetime_marker_;
+#endif
   std::unique_ptr<Utf16CharacterStream> character_stream_;
   std::unique_ptr<ConsumedPreparseData> consumed_preparse_data_;
   const AstRawString* function_name_;

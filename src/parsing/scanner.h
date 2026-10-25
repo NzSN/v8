@@ -146,6 +146,29 @@ class Utf16CharacterStream {
     return buffer_pos_ + (buffer_cursor_ - buffer_start_);
   }
 
+#if defined(V8_ENABLE_WRITESENTRY_SCANNER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH)
+  // WriteSentry scanner-watch (Phase 1, v8_enable_writesentry_scanner_watch):
+  // exposes the physical cursor field and the current buffer band so the
+  // parser can arm a hardware write-watchpoint on buffer_cursor_. Only
+  // present in builds that define the flag.
+  struct WritesentryWatchView {
+    uint64_t cursor_address;  // &buffer_cursor_
+    uint64_t band_lo;         // buffer_start_
+    uint64_t band_hi;         // buffer_end_ + 1
+  };
+  V8_INLINE WritesentryWatchView GetWritesentryWatchView() const {
+    WritesentryWatchView view;
+    view.cursor_address = reinterpret_cast<uint64_t>(&buffer_cursor_);
+    view.band_lo = reinterpret_cast<uint64_t>(buffer_start_);
+    view.band_hi = reinterpret_cast<uint64_t>(buffer_end_) + sizeof(uint16_t);
+    return view;
+  }
+#endif
+
+// Restore pristine line numbering (see the parser.cc counterpart).
+#line 148
+
   inline void Seek(size_t pos) {
     if (V8_LIKELY(pos >= buffer_pos_ &&
                   pos < (buffer_pos_ + (buffer_end_ - buffer_start_)))) {

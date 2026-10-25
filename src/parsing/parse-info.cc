@@ -234,6 +234,8 @@ ParseInfo::ParseInfo(LocalIsolate* isolate, const UnoptimizedCompileFlags flags,
 
 ParseInfo::~ParseInfo() { reusable_state_->NotifySingleParseCompleted(); }
 
+#line 237
+
 DeclarationScope* ParseInfo::scope() const { return literal()->scope(); }
 
 template <typename IsolateT>

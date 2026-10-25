@@ -38,6 +38,29 @@
 #include "src/tracing/trace-event.h"
 #include "src/zone/zone-list-inl.h"
 
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+#include "src/parsing/writesentry_parser_observer.h"
+#endif
+
+#if defined(V8_ENABLE_WRITESENTRY_SCANNER_WATCH)
+#include <windows.h>
+
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "writesentry/writesentry.h"
+#endif
+
+// Restore pristine line numbering for the rest of the file when the flag
+// is off (DCHECK line-number immediates and CodeView line tables must
+// stay identical to the unpatched build).
+#line 40
+
 namespace v8::internal {
 
 FunctionLiteral* Parser::DefaultConstructor(const AstRawString* name,
@@ -718,6 +741,373 @@ void MaybeProcessSourceRanges(ParseInfo* parse_info, Expression* root,
 
 }  // namespace
 
+#if defined(V8_ENABLE_WRITESENTRY_SCANNER_WATCH)
+
+// ---------------------------------------------------------------------------
+// WriteSentry scanner watch (Phase 1)
+//
+// Enabled only by the GN arg v8_enable_writesentry_scanner_watch. Arms one
+// WriteSentry hardware write-watchpoint on
+// Utf16CharacterStream::buffer_cursor_ for the duration of a toplevel parse
+// and disarms it at parse end. Any store to the cursor traps into
+// WriteSentry's VEH; confirmed hits are recorded on the trap path into a
+// fixed, preallocated ring (no heap, no locks, no kernel calls) and drained
+// to stderr after disarm. The watch covers the whole toplevel scan:
+// scanner_.Initialize() and DoParseProgram.
+//
+// Configuration (read once per arm from the process environment):
+//   WRITESENTRY_V8_SCANNER_WATCH_FILTER:
+//     "foreign" (default)  owner_thread_only=true, no allowed writer RIPs:
+//                          every store hits, owner and foreign alike.
+//     "all"                owner_thread_only=false, no allowed writer RIPs.
+//     "allow-owner:<o1>[,<o2>]" / "allow-all:<o1>[,<o2>]":
+//                          as above but up to two allowed writers, given as
+//                          trap-RIP offsets (the instruction AFTER the store)
+//                          from the main module base, hex or decimal.
+//   WRITESENTRY_V8_SCANNER_WATCH_PATTERN:
+//     "canary" (default)   Exact(1): inert first-phase canary. A legitimate
+//                          cursor is a pointer (or buffer_end_ + 1), so the
+//                          value 1 never matches legitimate stores.
+//     "any"                AnyChange: any value-changing store is a hit; a
+//                          pattern match overrides the writer filter.
+//     "band"               Range [buffer_start_, buffer_end_ + 1] sampled at
+//                          arm time. NOTE: under the current engine a pattern
+//                          MATCH is a hit (it does not whitelist), so "band"
+//                          triggers on in-band stores, and at the Phase-1 arm
+//                          point an unread d8 string stream samples a
+//                          degenerate band. Kept for Phase-2 revision.
+//
+// Boundaries (Phase 1): the streaming/background toplevel path
+// (Parser::ParseOnBackground) is not instrumented; threads created after the
+// arm need the host's ArmNewThreadForAllThreadsWatches hook, which d8 does not
+// need (its platform worker threads already exist); one armed session per
+// process is admitted (concurrent toplevel parses log a skip).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using writesentry::ArmSelfWatch;
+using writesentry::CoverageReport;
+using writesentry::DisarmSelfWatch;
+using writesentry::DumpSink;
+using writesentry::GetStats;
+using writesentry::HitAction;
+using writesentry::HitInfo;
+using writesentry::Pattern;
+using writesentry::PatternKind;
+using writesentry::SelfWatchSpec;
+using writesentry::SetDumpSink;
+using writesentry::Stats;
+using writesentry::ThreadScope;
+using writesentry::WriteSentryError;
+using writesentry::WriterFilter;
+
+constexpr uint32_t kWsScannerWatchMaxHits = 64;
+constexpr uint32_t kWsScannerWatchCursorSize = 8;
+
+struct WsScannerWatchHitRecord {
+  HitInfo info;
+  uint64_t trapped_module_offset;  // info.trapped_rip - module base.
+};
+
+std::atomic<uint32_t> g_ws_scanner_watch_hit_claims{0};
+std::atomic<uint32_t> g_ws_scanner_watch_hits_dropped{0};
+std::atomic<uint64_t> g_ws_scanner_watch_module_base{0};
+std::atomic<bool> g_ws_scanner_watch_active{false};
+WsScannerWatchHitRecord g_ws_scanner_watch_hits[kWsScannerWatchMaxHits];
+
+void WsScannerWatchLog(const char* format, ...) {
+  std::va_list arguments;
+  va_start(arguments, format);
+  std::fputs("[writesentry-v8-scanner-watch] ", stderr);
+  std::vfprintf(stderr, format, arguments);
+  std::fputc('\n', stderr);
+  va_end(arguments);
+  std::fflush(stderr);
+}
+
+// Trap-path sink: records into the preallocated ring only (async-safe).
+void WsScannerWatchDumpSink(const HitInfo& info) noexcept {
+  const uint32_t claim =
+      g_ws_scanner_watch_hit_claims.fetch_add(1, std::memory_order_relaxed);
+  if (claim >= kWsScannerWatchMaxHits) {
+    g_ws_scanner_watch_hits_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  WsScannerWatchHitRecord& record = g_ws_scanner_watch_hits[claim];
+  record.info = info;
+  const uint64_t base =
+      g_ws_scanner_watch_module_base.load(std::memory_order_relaxed);
+  record.trapped_module_offset =
+      (base != 0 && info.trapped_rip >= base) ? info.trapped_rip - base : 0;
+}
+
+void WsScannerWatchDrainHits() {
+  const uint32_t recorded =
+      std::min(g_ws_scanner_watch_hit_claims.load(std::memory_order_relaxed),
+               kWsScannerWatchMaxHits);
+  for (uint32_t i = 0; i < recorded; ++i) {
+    const WsScannerWatchHitRecord& record = g_ws_scanner_watch_hits[i];
+    const HitInfo& hit = record.info;
+    WsScannerWatchLog(
+        "hit[%u] label=%s size=%u dr=%u thread=%u owner=%u write=0x%llx "
+        "previous=0x%llx rip=0x%llx rip_module_offset=0x%llx address=0x%llx",
+        i, hit.label, hit.size, hit.dr_index, hit.thread_id,
+        hit.owner_thread_id, static_cast<unsigned long long>(hit.written_value),
+        static_cast<unsigned long long>(hit.previous_value),
+        static_cast<unsigned long long>(hit.trapped_rip),
+        static_cast<unsigned long long>(record.trapped_module_offset),
+        static_cast<unsigned long long>(hit.address));
+  }
+  const uint32_t dropped =
+      g_ws_scanner_watch_hits_dropped.load(std::memory_order_relaxed);
+  if (dropped != 0) {
+    WsScannerWatchLog("hits_dropped=%u (ring capacity %u)", dropped,
+                      kWsScannerWatchMaxHits);
+  }
+  g_ws_scanner_watch_hit_claims.store(0, std::memory_order_relaxed);
+  g_ws_scanner_watch_hits_dropped.store(0, std::memory_order_relaxed);
+}
+
+void WsScannerWatchResetFilter(WriterFilter* filter) {
+  filter->owner_thread_only = true;
+  filter->allowed_count = 0;
+  filter->allowed_next_rips[0] = 0;
+  filter->allowed_next_rips[1] = 0;
+}
+
+void WsScannerWatchParseFilter(const char* env, uint64_t module_base,
+                               WriterFilter* filter) {
+  WsScannerWatchResetFilter(filter);
+  if (env == nullptr || env[0] == '\0' || std::strcmp(env, "foreign") == 0) {
+    return;
+  }
+  if (std::strcmp(env, "all") == 0) {
+    filter->owner_thread_only = false;
+    return;
+  }
+  const bool allow_owner = std::strncmp(env, "allow-owner:", 12) == 0;
+  const bool allow_all = std::strncmp(env, "allow-all:", 10) == 0;
+  if (!allow_owner && !allow_all) {
+    WsScannerWatchLog(
+        "filter env '%s' is not a known filter mode; using default 'foreign'",
+        env);
+    return;
+  }
+  if (module_base == 0) {
+    WsScannerWatchLog(
+        "filter env '%s' needs a module base but GetModuleHandleW failed; "
+        "using default 'foreign'", env);
+    return;
+  }
+  filter->owner_thread_only = allow_owner;
+  const char* cursor = env + (allow_owner ? 12 : 10);
+  while (*cursor != '\0' && filter->allowed_count < 2) {
+    char* end = nullptr;
+    const unsigned long long offset = std::strtoull(cursor, &end, 0);
+    if (end == cursor) {
+      WsScannerWatchLog(
+          "filter env '%s' has an unparsable offset; using default 'foreign'",
+          env);
+      WsScannerWatchResetFilter(filter);
+      return;
+    }
+    filter->allowed_next_rips[filter->allowed_count++] =
+        module_base + static_cast<uint64_t>(offset);
+    cursor = end;
+    if (*cursor == ',') ++cursor;
+  }
+  if (*cursor != '\0' || filter->allowed_count == 0) {
+    WsScannerWatchLog(
+        "filter env '%s' has extra or missing offsets; using default 'foreign'",
+        env);
+    WsScannerWatchResetFilter(filter);
+  }
+}
+
+void WsScannerWatchParsePattern(const char* env, uint64_t band_lo,
+                                uint64_t band_hi, Pattern* pattern) {
+  pattern->kind = PatternKind::Exact;
+  pattern->value = 1;
+  pattern->mask = 0;
+  pattern->lo = 0;
+  pattern->hi = 0;
+  if (env == nullptr || env[0] == '\0' || std::strcmp(env, "canary") == 0) {
+    return;
+  }
+  if (std::strcmp(env, "any") == 0) {
+    pattern->kind = PatternKind::AnyChange;
+    pattern->value = 0;
+    return;
+  }
+  if (std::strcmp(env, "band") == 0) {
+    pattern->kind = PatternKind::Range;
+    pattern->lo = band_lo;
+    pattern->hi = band_hi;
+    return;
+  }
+  WsScannerWatchLog(
+      "pattern env '%s' is not a known pattern mode; using default 'canary'",
+      env);
+}
+
+class WsScannerWatchScope {
+ public:
+  explicit WsScannerWatchScope(Utf16CharacterStream* stream) { Arm(stream); }
+  WsScannerWatchScope(const WsScannerWatchScope&) = delete;
+  WsScannerWatchScope& operator=(const WsScannerWatchScope&) = delete;
+  ~WsScannerWatchScope() { Disarm(); }
+
+ private:
+  void Arm(Utf16CharacterStream* stream) {
+    if (stream == nullptr) {
+      WsScannerWatchLog("skip: no character stream");
+      return;
+    }
+    bool expected = false;
+    if (!g_ws_scanner_watch_active.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      WsScannerWatchLog(
+          "skip: a scanner watch is already active in this process");
+      return;
+    }
+    const uint64_t module_base =
+        reinterpret_cast<uint64_t>(::GetModuleHandleW(nullptr));
+    g_ws_scanner_watch_module_base.store(module_base,
+                                         std::memory_order_relaxed);
+
+    const char* filter_env = ::getenv("WRITESENTRY_V8_SCANNER_WATCH_FILTER");
+    const char* pattern_env = ::getenv("WRITESENTRY_V8_SCANNER_WATCH_PATTERN");
+    if (filter_env == nullptr) filter_env = "";
+    if (pattern_env == nullptr) pattern_env = "";
+
+    const Utf16CharacterStream::WritesentryWatchView view =
+        stream->GetWritesentryWatchView();
+
+    SelfWatchSpec spec{};
+    spec.address = view.cursor_address;
+    spec.size = kWsScannerWatchCursorSize;
+    WsScannerWatchParsePattern(pattern_env, view.band_lo, view.band_hi,
+                               &spec.pattern);
+    WsScannerWatchParseFilter(filter_env, module_base, &spec.filter);
+    spec.action = HitAction::kDump;
+    spec.raise_code = 0;
+    spec.scope = ThreadScope::kAllThreads;
+    {
+      constexpr char kLabel[] = "v8-scanner-cursor";
+      static_assert(sizeof(kLabel) <= writesentry::kMaxLabelLen);
+      for (size_t i = 0; i < sizeof(kLabel); ++i) spec.label[i] = kLabel[i];
+    }
+
+    if (spec.address == 0 ||
+        (spec.address & (kWsScannerWatchCursorSize - 1)) != 0) {
+      WsScannerWatchLog(
+          "skip: cursor address 0x%llx is not an aligned 8-byte field",
+          static_cast<unsigned long long>(spec.address));
+      g_ws_scanner_watch_active.store(false, std::memory_order_release);
+      return;
+    }
+
+    previous_sink_ = SetDumpSink(&WsScannerWatchDumpSink);
+    sink_installed_ = true;
+    arm_stats_ = GetStats();
+    CoverageReport coverage{};
+    arm_result_ = ArmSelfWatch(spec, &coverage);
+    if (arm_result_ == WriteSentryError::kOk ||
+        arm_result_ == WriteSentryError::kPartialCoverage) {
+      spec_ = spec;
+      watch_active_ = true;
+    } else {
+      SetDumpSink(previous_sink_);
+      sink_installed_ = false;
+      g_ws_scanner_watch_active.store(false, std::memory_order_release);
+    }
+    WsScannerWatchLog(
+        "arm label=%s result=%u filter_env='%s' pattern_env='%s' "
+        "filter{owner_only=%d allowed_count=%u allowed0=0x%llx allowed1=0x%llx} "
+        "pattern{kind=%u value=0x%llx lo=0x%llx hi=0x%llx} address=0x%llx "
+        "size=%u scope=kAllThreads coverage{discovered=%u verified=%u "
+        "exited=%u snapshot_failures=%u open_failures=%u helper_failures=%u "
+        "veh_registration_failures=%u suspend_failures=%u "
+        "get_context_failures=%u set_context_failures=%u readback_failures=%u "
+        "resume_failures=%u foreign_conflicts=%u lifecycle_conflicts=%u}",
+        spec.label, static_cast<unsigned>(arm_result_), filter_env, pattern_env,
+        spec.filter.owner_thread_only ? 1 : 0, spec.filter.allowed_count,
+        static_cast<unsigned long long>(spec.filter.allowed_next_rips[0]),
+        static_cast<unsigned long long>(spec.filter.allowed_next_rips[1]),
+        static_cast<unsigned>(spec.pattern.kind),
+        static_cast<unsigned long long>(spec.pattern.value),
+        static_cast<unsigned long long>(spec.pattern.lo),
+        static_cast<unsigned long long>(spec.pattern.hi),
+        static_cast<unsigned long long>(spec.address),
+        static_cast<unsigned>(spec.size), coverage.threads_discovered,
+        coverage.threads_verified, coverage.threads_exited,
+        coverage.snapshot_failures, coverage.open_failures,
+        coverage.helper_failures, coverage.veh_registration_failures,
+        coverage.suspend_failures, coverage.get_context_failures,
+        coverage.set_context_failures, coverage.readback_failures,
+        coverage.resume_failures, coverage.foreign_conflicts,
+        coverage.lifecycle_conflicts);
+  }
+
+  void Disarm() {
+    if (!watch_active_) return;
+    CoverageReport coverage{};
+    WriteSentryError result = DisarmSelfWatch(spec_.address, &coverage);
+    if (result != WriteSentryError::kOk) {
+      WsScannerWatchLog("disarm retry: first attempt returned result=%u",
+                        static_cast<unsigned>(result));
+      CoverageReport retry_coverage{};
+      result = DisarmSelfWatch(spec_.address, &retry_coverage);
+      coverage = retry_coverage;
+    }
+    const Stats final_stats = GetStats();
+    WsScannerWatchLog(
+        "disarm label=%s result=%u hits=%llu traps=%llu filtered=%llu "
+        "dumps=%llu rejected=%llu arm_failures=%llu coverage{discovered=%u "
+        "verified=%u exited=%u snapshot_failures=%u foreign_conflicts=%u "
+        "lifecycle_conflicts=%u}",
+        spec_.label, static_cast<unsigned>(result),
+        static_cast<unsigned long long>(final_stats.hits - arm_stats_.hits),
+        static_cast<unsigned long long>(final_stats.traps - arm_stats_.traps),
+        static_cast<unsigned long long>(final_stats.filtered -
+                                        arm_stats_.filtered),
+        static_cast<unsigned long long>(final_stats.dumps - arm_stats_.dumps),
+        static_cast<unsigned long long>(final_stats.rejected -
+                                        arm_stats_.rejected),
+        static_cast<unsigned long long>(final_stats.arm_failures -
+                                        arm_stats_.arm_failures),
+        coverage.threads_discovered, coverage.threads_verified,
+        coverage.threads_exited, coverage.snapshot_failures,
+        coverage.foreign_conflicts, coverage.lifecycle_conflicts);
+    if (result != WriteSentryError::kOk) {
+      WsScannerWatchLog(
+          "disarm did not complete; hardware watch state is retained and must "
+          "not be assumed clean");
+    }
+    WsScannerWatchDrainHits();
+    if (sink_installed_) {
+      SetDumpSink(previous_sink_);
+      sink_installed_ = false;
+    }
+    g_ws_scanner_watch_active.store(false, std::memory_order_release);
+    watch_active_ = false;
+  }
+
+  SelfWatchSpec spec_{};
+  WriteSentryError arm_result_ = WriteSentryError::kOk;
+  Stats arm_stats_{};
+  DumpSink previous_sink_ = nullptr;
+  bool sink_installed_ = false;
+  bool watch_active_ = false;
+};
+
+}  // namespace
+
+#endif
+
+// Restore pristine line numbering (see flag-off parity note above).
+#line 721
 void Parser::ParseProgram(Isolate* isolate, DirectHandle<Script> script,
                           ParseInfo* info,
                           MaybeDirectHandle<ScopeInfo> maybe_outer_scope_info) {
@@ -743,7 +1133,29 @@ void Parser::ParseProgram(Isolate* isolate, DirectHandle<Script> script,
     maybe_wrapped_arguments_ = handle(script->wrapped_arguments(), isolate);
   }
 
+#if defined(V8_ENABLE_WRITESENTRY_SCANNER_WATCH)
+  WsScannerWatchScope ws_scanner_watch_scope(info->character_stream());
+#endif
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  uint64_t ws_cursor_address = 0;
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH)
+  ws_cursor_address = info->character_stream()
+                          ->GetWritesentryWatchView()
+                          .cursor_address;
+#endif
+  ParserObservationScope ws_selected_scope(
+      ParserObservationKind::kProgram, this, info->character_stream(),
+      ws_cursor_address);
+#endif
+// Restore pristine line numbering (see flag-off parity note above).
+#line 746
   scanner_.Initialize();
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  ws_selected_scope.OnInitialized();
+#endif
+#line 746
   FunctionLiteral* result =
       DoParseProgram(isolate, info, script->eval_from_position());
   if (flags().allow_heap_allocation()) {
@@ -756,6 +1168,11 @@ void Parser::ParseProgram(Isolate* isolate, DirectHandle<Script> script,
     MaybeProcessSourceRanges(info, result, stack_limit_);
   }
   PostProcessParseResult(isolate, info, result);
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  ws_selected_scope.OnParseComplete();
+#endif
+#line 759
 
   if (V8_UNLIKELY(v8_flags.log_function_events) && !flags().is_reparse()) {
     double ms = timer.Elapsed().InMillisecondsF();
@@ -1096,7 +1513,24 @@ void Parser::ParseFunction(Isolate* isolate, ParseInfo* info,
   // Initialize parser state.
   info->set_function_name(ast_value_factory()->GetString(
       shared_info->Name(), SharedStringAccessGuardIfNeeded(isolate)));
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  uint64_t ws_cursor_address = 0;
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH)
+  ws_cursor_address = info->character_stream()
+                          ->GetWritesentryWatchView()
+                          .cursor_address;
+#endif
+  ParserObservationScope ws_selected_scope(
+      ParserObservationKind::kFunction, this, info->character_stream(),
+      ws_cursor_address);
+#endif
   scanner_.Initialize();
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  ws_selected_scope.OnInitialized();
+#endif
+#line 1099
 
   FunctionKind function_kind = flags().function_kind();
   FunctionLiteral* result;
@@ -1128,6 +1562,11 @@ void Parser::ParseFunction(Isolate* isolate, ParseInfo* info,
 
   MaybeProcessSourceRanges(info, result, stack_limit_);
   PostProcessParseResult(isolate, info, result);
+#if defined(V8_ENABLE_WRITESENTRY_SELECTED_WORKER_WATCH) || \
+    defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  ws_selected_scope.OnParseComplete();
+#endif
+#line 1131
   if (V8_UNLIKELY(v8_flags.log_function_events)) {
     double ms = timer.Elapsed().InMillisecondsF();
     // We should already be internalized by now, so the debug name will be
@@ -3645,6 +4084,10 @@ void Parser::UpdateStatistics(
 void Parser::ParseOnBackground(LocalIsolate* isolate, ParseInfo* info,
                                DirectHandle<Script> script, int start_position,
                                int end_position, int function_literal_id) {
+#if defined(V8_ENABLE_WRITESENTRY_PARSER_TIMING)
+  NoteParserBackgroundEntry();
+#endif
+#line 3646
   RCS_SCOPE(isolate, RuntimeCallCounterId::kParseProgram,
             RuntimeCallStats::CounterMode::kThreadSpecific);
   parsing_on_main_thread_ = false;
